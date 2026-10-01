@@ -34,6 +34,19 @@ global {
 	
 	map<point, bool> is_drain <- [];
 	list<point> inf_cells <- [];
+	
+	float lateral <- 0.02; // sideways conductance on flat cells
+	float flat_tol <- 0.01; // elevation tolerance to count as flat
+	
+	float flood_threshold <- 0.05; // flow height counted as "flooded"
+	int flooded_count <- 0;
+	
+	list<float> level_bins <- [0.0, 0.02, 0.05, 0.1, 0.2, 0.5]; // lower bound of each level
+	list<int> level_counts <- [0, 0, 0, 0, 0, 0];
+	
+	list<float> level_sums <- [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+	int stat_cycles <- 0;	
+	list<float> level_avg <- [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
 	init {
 		flow[] <- 0.0;
@@ -51,28 +64,25 @@ global {
 		is_river <- points as_map (each::(river_g intersects each));
 		rivers_pt <- points where (is_river[each]);
 		
-		// neighbors from grid indices, street cells only
-		int cols <- terrain.columns;
-		int rws <- terrain.rows;
-		float cw <- shape.width / cols;
-		float chh <- shape.height / rws;
-		float x0 <- shape.location.x - shape.width / 2;
-		float y0 <- shape.location.y - shape.height / 2;
+		// neighbors from rounded grid indices, street cells only
+		float cw <- shape.width / terrain.columns;
+		float chh <- shape.height / terrain.rows;
+		float x0 <- min(points collect each.x);
+		float y0 <- min(points collect each.y);
+		int stride <- terrain.columns + 4; // margin so keys never wrap between rows
 		map<int, point> by_idx <- [];
+		map<point, int> cidx <- [];
 		loop p over: rivers_pt {
-			by_idx[int(floor((p.x - x0) / cw)) + int(floor((p.y - y0) / chh)) * cols] <- p;
+			int k <- int(round((p.x - x0) / cw)) + int(round((p.y - y0) / chh)) * stride;
+			by_idx[k] <- p;
+			cidx[p] <- k;
 		}
+		write "street cells " + length(rivers_pt) + " unique idx " + length(by_idx);
 		loop p over: rivers_pt {
-			int c <- int(floor((p.x - x0) / cw));
-			int r <- int(floor((p.y - y0) / chh));
+			int k <- cidx[p];
 			list<point> ln <- [];
-			loop dc from: -1 to: 1 {
-				loop dr from: -1 to: 1 {
-					int k <- c + dc + (r + dr) * cols;
-					if ((dc != 0 or dr != 0) and c + dc >= 0 and c + dc < cols and r + dr >= 0 and r + dr < rws and (by_idx contains_key k)) {
-						add by_idx[k] to: ln;
-					}
-				}
+			loop d over: [-1, 1, -stride, stride, -stride - 1, -stride + 1, stride - 1, stride + 1] {
+				if (by_idx contains_key (k + d)) { add by_idx[k + d] to: ln; }
 			}
 			neighbors[p] <- ln;
 		}
@@ -131,9 +141,9 @@ global {
 			
 			// static downhill neighbors and slope weights
 			loop p over: inf_cells {
-				list<point> ln <- neighbors[p] where (is_river[each] and (w contains_key each) and w[each] < w[p]);
+				list<point> ln <- neighbors[p] where ((w contains_key each) and w[each] <= w[p] + flat_tol);
 				if (!empty(ln)) {
-					list<float> s <- ln collect ((w[p] - w[each]) / (p distance_to each));
+					list<float> s <- ln collect (max(w[p] - w[each], 0.0) / (p distance_to each) + lateral);
 					float t <- sum(s);
 					down[p] <- ln;
 					down_w[p] <- s collect (each / t);
@@ -184,6 +194,27 @@ global {
 		}
 	}
 	
+	reflex flood_stats {
+		flooded_count <- length(rivers_pt where (flow[each] >= flood_threshold));
+	}
+	
+	reflex level_stats {
+		list<int> counts <- [];
+		loop i from: 0 to: length(level_bins) - 1 {
+			float lo <- level_bins[i];
+			float hi <- (i = length(level_bins) - 1) ? 99999.0 : level_bins[i + 1];
+			add length(rivers_pt where (flow[each] >= lo and flow[each] < hi)) to: counts;
+		}
+		level_counts <- counts;
+		stat_cycles <- stat_cycles + 1;
+		loop i from: 0 to: length(level_bins) - 1 {
+			level_sums[i] <- level_sums[i] + counts[i];
+		}
+		loop i from: 0 to: length(level_bins) - 1 {
+			level_avg[i] <- level_sums[i] / max(1, stat_cycles);
+		}
+	}
+	
 	action fill_from (list<point> seeds) {
 		list<point> frontier <- copy(seeds);
 		loop s over: seeds { w[s] <- h[s]; }
@@ -208,6 +239,7 @@ experiment hydro type: gui {
 	parameter "Infiltration Rate" var: infiltration_rate <- 0.001 min: 0.0 max: 0.05 step: 0.001;
 	parameter "Fill streets initially" var: fill <- false;
 	parameter "Use DEM Elevation" var: use_dem_elevation <- true;
+	parameter "Flood threshold" var: flood_threshold <- 0.05 min: 0.001 max: 0.5 step: 0.005;
 
 	output {
 		display d type: 3d {
@@ -219,5 +251,31 @@ experiment hydro type: gui {
 			
 			mesh flow scale: 1.0 triangulation: true color: palette(reverse(brewer_colors("Blues"))) transparency: 0.3 no_data: 0.0;
 		}
+		display charts refresh: every(1#cycle) {
+			chart "Flooded cells" type: series {
+				data "flooded" value: flooded_count color: #red;
+			}
+		}
+		display levels refresh: every(1#cycle) {
+			chart "Cells by water level" type: histogram {
+				data "0.00-0.02" value: level_counts[0] color: #lightblue;
+				data "0.02-0.05" value: level_counts[1] color: #deepskyblue;
+				data "0.05-0.10" value: level_counts[2] color: #dodgerblue;
+				data "0.10-0.20" value: level_counts[3] color: #royalblue;
+				data "0.20-0.50" value: level_counts[4] color: #mediumblue;
+				data "0.50+"     value: level_counts[5] color: #darkblue;
+			}
+		}
+		display average refresh: every(1#cycle) {
+			chart "Average cells by level (all cycles)" type: pie {
+				data "0.00-0.02" value: level_avg[0] color: #lightblue;
+				data "0.02-0.05" value: level_avg[1] color: #deepskyblue;
+				data "0.05-0.10" value: level_avg[2] color: #dodgerblue;
+				data "0.10-0.20" value: level_avg[3] color: #royalblue;
+				data "0.20-0.50" value: level_avg[4] color: #mediumblue;
+				data "0.50+"     value: level_avg[5] color: #darkblue;
+			}
+		}
+				
 	}
 }
